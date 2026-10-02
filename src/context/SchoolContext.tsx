@@ -23,6 +23,15 @@ import {
   syncAllToSql, 
   fetchStudentsFromSql 
 } from '../services/sqlDatabaseService';
+import {
+  persistStudentsResiliently,
+  safeLocalStorageSet,
+  safeLocalStorageGet,
+  safeLocalStorageRemove,
+  idbGet,
+  idbSet,
+  idbDelete
+} from '../utils/storageHelper';
 
 export const defaultPermissions: Record<UserRole, RolePermissions> = {
   admin: {
@@ -327,12 +336,7 @@ const STORAGE_KEY_CURRENT_USER = 'buku_induk_current_user_v1';
 export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // Load students from localStorage or initial
   const [students, setStudents] = useState<Student[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_STUDENTS);
-      return saved ? JSON.parse(saved) : initialStudents;
-    } catch {
-      return initialStudents;
-    }
+    return safeLocalStorageGet<Student[]>(STORAGE_KEY_STUDENTS, initialStudents);
   });
 
   // Load school profile
@@ -493,40 +497,85 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       document.documentElement.setAttribute('data-theme', 'light');
       document.documentElement.style.colorScheme = 'light';
     }
-    localStorage.setItem(STORAGE_KEY_DARK, JSON.stringify(darkMode));
+    safeLocalStorageSet(STORAGE_KEY_DARK, JSON.stringify(darkMode));
   }, [darkMode]);
 
-  // Sync to local storage
+  // Asynchronously hydrate from IndexedDB to restore full resolution photos, documents, and large datasets
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_STUDENTS, JSON.stringify(students));
+    let isMounted = true;
+    idbGet<Student[]>('students')
+      .then((idbStudents) => {
+        if (isMounted && idbStudents && Array.isArray(idbStudents) && idbStudents.length > 0) {
+          setStudents((prev) => {
+            // If prev was lean or initial or lacks photos stored in IDB, hydrate with full IDB data
+            if (
+              prev.length <= idbStudents.length ||
+              prev.some(s => s.sttb?.fotoIjazah === '[IDB_STORED]' || s.mutasi?.fotoIjazah === '[IDB_STORED]')
+            ) {
+              return idbStudents;
+            }
+            return prev;
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn('[SchoolContext] IndexedDB initial load error:', err);
+      });
+
+    idbGet<SchoolProfile>('school_profile')
+      .then((idbProfile) => {
+        if (isMounted && idbProfile) {
+          setSchoolProfile((prev) => ({ ...prev, ...idbProfile }));
+        }
+      })
+      .catch(() => {});
+
+    idbGet<AdminUser[]>('admin_users')
+      .then((idbUsers) => {
+        if (isMounted && idbUsers && Array.isArray(idbUsers) && idbUsers.length > 0) {
+          setAdminUsers(idbUsers);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Sync students safely to IndexedDB & localStorage without quota crashes
+  useEffect(() => {
+    persistStudentsResiliently(STORAGE_KEY_STUDENTS, students);
   }, [students]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_SCHOOL, JSON.stringify(schoolProfile));
+    idbSet('school_profile', schoolProfile).catch(() => {});
+    safeLocalStorageSet(STORAGE_KEY_SCHOOL, JSON.stringify(schoolProfile));
   }, [schoolProfile]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_LOGS, JSON.stringify(activityLogs));
+    safeLocalStorageSet(STORAGE_KEY_LOGS, JSON.stringify(activityLogs));
   }, [activityLogs]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_ROLE, currentRole);
+    safeLocalStorageSet(STORAGE_KEY_ROLE, currentRole);
   }, [currentRole]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_PERMISSIONS, JSON.stringify(rolePermissions));
+    safeLocalStorageSet(STORAGE_KEY_PERMISSIONS, JSON.stringify(rolePermissions));
   }, [rolePermissions]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_USERS, JSON.stringify(adminUsers));
+    idbSet('admin_users', adminUsers).catch(() => {});
+    safeLocalStorageSet(STORAGE_KEY_USERS, JSON.stringify(adminUsers));
   }, [adminUsers]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_SECURITY, JSON.stringify(securitySettings));
+    safeLocalStorageSet(STORAGE_KEY_SECURITY, JSON.stringify(securitySettings));
   }, [securitySettings]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_AUTH, JSON.stringify(isAuthenticated));
+    safeLocalStorageSet(STORAGE_KEY_AUTH, JSON.stringify(isAuthenticated));
   }, [isAuthenticated]);
 
   // Cloud SQL (PostgreSQL) Status
@@ -550,9 +599,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   useEffect(() => {
     if (currentUser) {
-      localStorage.setItem(STORAGE_KEY_CURRENT_USER, JSON.stringify(currentUser));
+      safeLocalStorageSet(STORAGE_KEY_CURRENT_USER, JSON.stringify(currentUser));
     } else {
-      localStorage.removeItem(STORAGE_KEY_CURRENT_USER);
+      safeLocalStorageRemove(STORAGE_KEY_CURRENT_USER);
     }
   }, [currentUser]);
 
@@ -565,7 +614,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       live: Math.floor(Math.random() * 5) + 4,
     };
     setVisitorStats(updated);
-    localStorage.setItem(STORAGE_KEY_VISITORS, JSON.stringify(updated));
+    safeLocalStorageSet(STORAGE_KEY_VISITORS, JSON.stringify(updated));
   }, []);
 
   const toggleDarkMode = () => {
@@ -976,7 +1025,8 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const deleteAllStudents = () => {
     const count = students.length;
     setStudents([]);
-    localStorage.removeItem(STORAGE_KEY_STUDENTS);
+    safeLocalStorageRemove(STORAGE_KEY_STUDENTS);
+    idbDelete('students').catch(() => {});
     logActivity('HAPUS', `Menghapus seluruh data siswa (${count} siswa) dari Buku Induk`);
   };
 
@@ -1721,12 +1771,15 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setRolePermissions(defaultPermissions);
     setAdminUsers(initialAdminUsers);
     setSecuritySettings(initialSecuritySettings);
-    localStorage.removeItem(STORAGE_KEY_STUDENTS);
-    localStorage.removeItem(STORAGE_KEY_SCHOOL);
-    localStorage.removeItem(STORAGE_KEY_LOGS);
-    localStorage.removeItem(STORAGE_KEY_PERMISSIONS);
-    localStorage.removeItem(STORAGE_KEY_USERS);
-    localStorage.removeItem(STORAGE_KEY_SECURITY);
+    safeLocalStorageRemove(STORAGE_KEY_STUDENTS);
+    safeLocalStorageRemove(STORAGE_KEY_SCHOOL);
+    safeLocalStorageRemove(STORAGE_KEY_LOGS);
+    safeLocalStorageRemove(STORAGE_KEY_PERMISSIONS);
+    safeLocalStorageRemove(STORAGE_KEY_USERS);
+    safeLocalStorageRemove(STORAGE_KEY_SECURITY);
+    idbDelete('students').catch(() => {});
+    idbDelete('school_profile').catch(() => {});
+    idbDelete('admin_users').catch(() => {});
     logActivity('PENGATURAN', 'Mereset database Buku Induk kembali ke data bawaan sistem');
   };
 

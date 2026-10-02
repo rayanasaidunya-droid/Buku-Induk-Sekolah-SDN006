@@ -214,37 +214,42 @@ export function createLeanStudentsForLocalStorage(students: Student[]): Student[
   return students.map((s) => {
     let lean = { ...s };
 
-    // If fotoUrl is a massive base64 (> 100KB), replace with indicator or keep if small/http
-    if (lean.fotoUrl && lean.fotoUrl.startsWith('data:') && lean.fotoUrl.length > 80000) {
-      lean = {
-        ...lean,
-        fotoUrl: 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=240&auto=format&fit=crop&q=80',
+    // Strip base64 fotoUrl to lightweight placeholder
+    if (lean.fotoUrl && (lean.fotoUrl.startsWith('data:') || lean.fotoUrl.length > 5000)) {
+      lean.fotoUrl = 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=240&auto=format&fit=crop&q=80';
+    }
+
+    // Strip heavy base64 mutasi scan
+    if (lean.mutasi?.fotoIjazah && (lean.mutasi.fotoIjazah.startsWith('data:') || lean.mutasi.fotoIjazah.length > 1000)) {
+      lean.mutasi = {
+        ...lean.mutasi,
+        fotoIjazah: '[IDB_STORED]',
       };
     }
 
-    // If mutasi has large base64 scan
-    if (lean.mutasi?.fotoIjazah && lean.mutasi.fotoIjazah.startsWith('data:') && lean.mutasi.fotoIjazah.length > 80000) {
-      lean = {
-        ...lean,
-        mutasi: {
-          ...lean.mutasi,
-          fotoIjazah: '[IDB_STORED]',
-        },
-      };
-    }
-
-    // If sttb has large base64 scan
-    if (lean.sttb?.fotoIjazah && lean.sttb.fotoIjazah.startsWith('data:') && lean.sttb.fotoIjazah.length > 80000) {
-      lean = {
-        ...lean,
-        sttb: {
-          ...lean.sttb,
-          fotoIjazah: '[IDB_STORED]',
-        },
+    // Strip heavy base64 sttb scan
+    if (lean.sttb?.fotoIjazah && (lean.sttb.fotoIjazah.startsWith('data:') || lean.sttb.fotoIjazah.length > 1000)) {
+      lean.sttb = {
+        ...lean.sttb,
+        fotoIjazah: '[IDB_STORED]',
       };
     }
 
     return lean;
+  });
+}
+
+/**
+ * Ultra-lean version: for large student databases (e.g. hundreds of students with full report grades)
+ * Keeps essential identity, address, parents, and recent reports in localStorage cache
+ */
+export function createUltraLeanStudentsForLocalStorage(students: Student[]): Student[] {
+  return students.map((s) => {
+    const lean = createLeanStudentsForLocalStorage([s])[0];
+    return {
+      ...lean,
+      raport: (lean.raport || []).slice(-2), // keep only last 2 semester reports in localStorage cache
+    };
   });
 }
 
@@ -254,31 +259,44 @@ export function createLeanStudentsForLocalStorage(students: Student[]): Student[
  * 2. Synchronously into localStorage as fast boot cache:
  *    - First attempt with full data.
  *    - If quota exceeded, clean volatile storage and retry with lean version.
- *    - Never throws QuotaExceededError!
+ *    - If still exceeded, retry with ultra-lean or subset.
+ *    - NEVER throws QuotaExceededError!
  */
 export function persistStudentsResiliently(
   storageKey: string,
   students: Student[]
 ): void {
-  // 1. IndexedDB persistence (unlimited storage, full fidelity)
+  // 1. IndexedDB persistence (unlimited storage, full fidelity, zero quota errors)
   idbSet('students', students).catch((err) => {
     console.warn('[storageHelper] Failed to persist students to IndexedDB:', err);
   });
 
-  // 2. LocalStorage persistence (fast synchronous startup cache)
+  // 2. LocalStorage persistence (fast synchronous startup cache with progressive tier fallbacks)
   try {
     const json = JSON.stringify(students);
     const success = safeLocalStorageSet(storageKey, json);
     if (!success) {
-      // Save lean version
+      // Tier 1: Strip base64 images
       const lean = createLeanStudentsForLocalStorage(students);
-      safeLocalStorageSet(storageKey, JSON.stringify(lean));
+      const leanSuccess = safeLocalStorageSet(storageKey, JSON.stringify(lean));
+      if (!leanSuccess) {
+        // Tier 2: Strip heavy report histories
+        const ultraLean = createUltraLeanStudentsForLocalStorage(students);
+        const ultraSuccess = safeLocalStorageSet(storageKey, JSON.stringify(ultraLean));
+        if (!ultraSuccess && students.length > 50) {
+          // Tier 3: Store subset as immediate cache; IndexedDB loads all students on mount
+          const subset = ultraLean.slice(0, 50);
+          safeLocalStorageSet(storageKey, JSON.stringify(subset));
+        }
+      }
     }
   } catch (err) {
-    console.warn('[storageHelper] Failed to serialize students for localStorage:', err);
+    console.warn('[storageHelper] Fallback saving students to localStorage:', err);
     try {
       const lean = createLeanStudentsForLocalStorage(students);
       safeLocalStorageSet(storageKey, JSON.stringify(lean));
-    } catch {}
+    } catch {
+      // Absolutely never throw
+    }
   }
 }
